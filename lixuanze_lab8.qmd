@@ -1,0 +1,122 @@
+---
+title: "lixuanze_lab8"
+format: html
+editor: visual
+---
+
+## Quarto
+
+Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
+
+## Radon
+
+The goal of this lab is to fit this model to the radon data:
+
+
+\$\$
+\\begin{aligned}
+y\_{i} \| \\alpha\_{j\[i\]} & \\sim N\\left(\\alpha\_{j\[i\]}+\\beta x\_{i}, \\sigma\_{y}\^{2}\\right), \\text { for } i=1,2, \\ldots, n \\\\
+\\alpha\_{j} & \\sim N\\left(\\gamma\_{0}+\\gamma\_{1} u\_{j}, \\sigma\_{\\alpha}\^{2}\\right), \\text { for } j=1,2, \\ldots, J
+\\end{aligned}
+\$\$
+
+i.e. varying intercepts, fixed slope on floor. I want you to 
+
+- reproduce the graph on slide 53 
+- plot samples from the posterior predictive distribution for a new household in county 2 with basement level measurement, compared to samples from the posterior distribution of the mean county effect in county 2 (i.e., a graph similar to slide 45).
+
+Here's code to get the data into a useful format:
+
+```{r}
+library(tidyverse)
+# house level data
+d <- read.table(url("http://www.stat.columbia.edu/~gelman/arm/examples/radon/srrs2.dat"), header=T, sep=",")
+
+# deal with zeros, select what we want, makke a fips variable to match on 
+d <- d |> 
+  mutate(activity = ifelse(activity==0, 0.1, activity)) |> 
+  mutate(fips = stfips * 1000 + cntyfips) |>   
+  dplyr::select(fips, state, county, floor, activity)
+
+# county level data
+cty <- read.table(url("http://www.stat.columbia.edu/~gelman/arm/examples/radon/cty.dat"), header = T, sep = ",")
+cty <- cty |> mutate(fips = 1000 * stfips + ctfips) |> dplyr::select(fips, Uppm)
+
+# filter to just be minnesota, join them and then select the variables of interest. 
+dmn <- d |> 
+  filter(state=="MN") |> 
+  dplyr::select(fips, county, floor, activity) |> 
+  left_join(cty)
+head(dmn)
+```
+
+Note, in the model:
+
+- \$y_i\$ is log(activity)
+- \$x_i\$ is floor
+- \$u_i\$ is log(Uppm)
+
+
+
+Suggested steps
+
+1. write Stan model (note, you will need samples from post pred distribution, either do in Stan or later in R)
+
+
+Answer: Please see radon.stan file.
+
+
+2. Get data in stan format
+
+```{r}
+library(rstan)
+
+# data transformations
+N_obs <- nrow(dmn)
+u <- log(dmn |> group_by(county) |> slice(1) |> select(Uppm) |> pull())
+x <- dmn$floor
+y <- log(dmn$activity)
+county <- as.numeric(as.factor(dmn$county))
+J <- length(unique(dmn$county))
+
+stan_data <- list(y = y, x = x, u = u, N = N_obs, J = J, county = county)
+```
+
+3\. Run the model
+
+```{r}
+hirechy_model <- stan(data = stan_data, file = "radon.stan")
+```
+
+4\. For \$\\alpha\$ plot, get median estimates of alpha's, and the 2.5th and 97.5th percentiles. Also get the median (mean fine, easier to pull from summary) of the gamma0 and gamma1. You can then use \`geom_abline()\` to plot mean regression line.
+
+```{r}
+extracted_samples <- rstan::extract(hirechy_model)
+names(extracted_samples)
+
+alpha_ <- apply(extracted_samples[["alpha"]], 2, median)
+alpha_lower <- apply(extracted_samples[["alpha"]], 2, quantile, 0.025)
+alpha_upper <- apply(extracted_samples[["alpha"]], 2, quantile, 0.975)
+
+alpha_df <- tibble(county = 1:J, median = alpha_, lower = alpha_lower, upper = alpha_upper, u = u)
+gamma0_ <- median(extracted_samples[["gamma0"]])
+gamma1_ <- median(extracted_samples[["gamma1"]])
+
+ggplot(alpha_df, aes(u, median)) + 
+  geom_point()+
+  geom_errorbar(aes(ymin = lower, ymax = upper))+
+  geom_abline(intercept = gamma0_, slope = gamma1_)
+```
+
+5\. For the predicted y plot, you will need your posterior predictive samples for \$y\$'s and then just use \`geom_density()\`
+
+```{r}
+alpha_2 <- extracted_samples[["alpha"]][,2]
+sigma_y <- extracted_samples[["sigma_y"]]
+y_replicated <- rnorm(alpha_2, sigma_y)
+
+tibble(alpha = alpha_2, y = y_replicated) |> 
+  ggplot(aes(y)) +
+  geom_density(aes(fill = "Predicted Y"), alpha = 0.6)+
+  geom_density(aes(alpha, fill = "Alpha"), alpha = 0.6)
+```

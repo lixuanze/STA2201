@@ -1,0 +1,574 @@
+---
+title: "Week 6: Visualizing the Bayesian Workflow"
+date: today
+date-format: "DD/MM/YY"
+format: pdf
+execute: 
+  warning: false
+  message: false
+---
+
+# Introduction
+
+This lab will be looking at trying to replicate some of the visualizations in the lecture notes, involving prior and posterior predictive checks, and LOO model comparisons. 
+
+The dataset is a 0.1% of all births in the US in 2017. I've pulled out a few different variables, but as in the lecture, we'll just focus on birth weight and gestational age. 
+
+# The data
+
+Read it in, along with all our packages. 
+
+```{r}
+library(tidyverse)
+library(here)
+# for bayes stuff
+library(rstan)
+library(bayesplot) 
+library(loo) 
+library(tidybayes) 
+
+ds <- read_rds("births_2017_sample.RDS")
+head(ds)
+```
+
+Brief overview of variables:
+
+- `mager` mum's age
+- `mracehisp` mum's race/ethnicity see here for codes: https://data.nber.org/natality/2017/natl2017.pdf page 15
+- `meduc` mum's education see here for codes: https://data.nber.org/natality/2017/natl2017.pdf page 16
+- `bmi` mum's bmi 
+- `sex` baby's sex
+- `combgest` gestational age in weeks
+- `dbwt` birth weight in kg
+- `ilive` alive at time of report y/n/ unsure
+
+I'm going to rename some variables, remove any observations with missing gestational age or birth weight, restrict just to babies that were alive, and make a preterm variable. 
+
+```{r}
+ds <- ds %>% 
+  rename(birthweight = dbwt, gest = combgest) %>% 
+  mutate(preterm = ifelse(gest<32, "Y", "N")) %>% 
+  filter(ilive=="Y",gest< 99, birthweight<9.999)
+```
+
+
+## Question 1
+
+Use plots or tables to show three interesting observations about the data. Remember:
+
+- Explain what your graph/ tables show
+- Choose a graph type that's appropriate to the data type
+- If you use `geom_smooth`, please also plot the underlying data
+
+Feel free to replicate one of the scatter plots in the lectures as one of the interesting observations, as those form the basis of our models. 
+
+1 - Analysis of Birth Weight to Gestational Age
+
+To begin, I used a scatter plot to analyze the relationship between the log of gestational age and the log of birth weight. We want to assess how gestational age correlates with birth weight and to observe any distinctions between preterm and full-term growth patterns. The results shows that there is a positive correlation: as gestational age increases, birth weight increases as well, with a more pronounced growth rate during the preterm phase.
+
+```{r}
+ggplot(ds, aes(x=log(gest), y = log(birthweight), color = preterm)) + 
+  geom_point() + 
+  geom_smooth(method = lm) +
+  theme_bw() +
+  scale_color_manual(values=c("red", "blue")) +
+  labs(x = "Log Gestational Age", y="Log Birth Weight", title = "Relationship Analysis: Log Gestational Age vs. Log Birth Weight with Preterm Distinction")
+```
+
+2 - Impact of Infant Sex on the Gestational Age-Birth Weight
+
+This scatter plot, supplemented by a smoothed trend line for each sex, aims to uncover potential differences in the birth weight-gestational age relationship between male and female infants. We found that while birth weight generally increases with gestational age for both sexes, the growth trajectory is slightly steeper for girls compared to boys, though boys tend to weigh more at equivalent gestational ages.
+
+```{r}
+ggplot(ds, aes(x=log(gest), y = log(birthweight))) + 
+  geom_point() + 
+  geom_smooth(method = lm,aes(color=sex)) +
+  theme_bw() +
+  scale_color_manual(values=c("red", "blue")) +
+  labs(x = "Log Gestational Age", y="Log Birth Weight", title = "Sex Differences: Log Gestational Age vs. Log Birth Weight")
+```
+3 - Investigating the Link Between Maternal Age and Infant Birth Weight
+
+Through a scatter plot with a linear regression trend line, we want to determine the correlation between maternal age (logged) and infant birth weight (logged). We find that there is no significant trend of increasing or decreasing birth weight with maternal age. Nonetheless, a tendency toward lower birth weights at higher maternal ages is observed, potentially indicating a greater risk of preterm birth among older mothers. 
+
+```{r}
+ggplot(ds, aes(x=log(mager), y = log(birthweight))) + 
+  geom_point() + 
+  geom_smooth(method = lm) +
+  theme_bw() +
+  labs(x = "Log Mother's Age", y="Log Birth Weight", title = "Exploring the Relationship: Log Mother's Age vs. Log Birth Weight")
+```
+
+
+# The model
+
+As in lecture, we will look at two candidate models 
+
+Model 1 has log birth weight as a function of log gestational age
+
+$$
+\log(y_i) \sim N(\beta_1 + \beta_2\log(x_i), \sigma^2)
+$$
+
+Model 2 has an interaction term between gestation and prematurity
+
+$$
+\log(y_i) \sim N(\beta_1 + \beta_2\log(x_i) + \beta_2 z_i + \beta_3\log(x_i) z_i, \sigma^2)
+$$
+
+- $y_i$ is weight in kg
+- $x_i$ is gestational age in weeks, CENTERED AND STANDARDIZED
+- $z_i$ is preterm (0 or 1, if gestational age is less than 32 weeks)
+
+
+# Prior predictive checks
+
+Let's put some weakly informative priors on all parameters i.e. for the $\beta$s
+
+$$
+\beta \sim N(0, 1)
+$$
+
+and for $\sigma$
+
+$$
+\sigma \sim N^+(0,1)
+$$
+where the plus means positive values only i.e. Half Normal. 
+
+Let's check to see what the resulting distribution of birth weights look like given Model 1 and the priors specified above, assuming we had no data on birth weight (but observations of gestational age).
+
+## Question 2
+
+For Model 1, simulate values of $\beta$s and $\sigma$ based on the priors above. Do 1000 simulations. Use these values to simulate (log) birth weights from the likelihood specified in Model 1, based on the set of observed gestational weights. **Remember the gestational weights should be centered and standardized**. 
+
+- Plot the resulting distribution of simulated (log) birth weights. 
+- Plot ten simulations of (log) birthweights against gestational age. 
+
+```{r}
+set.seed(2201)
+num_simulations <- 1000
+
+beta0_samples <- rnorm(num_simulations, mean = 0, sd = 1)
+beta1_samples <- rnorm(num_simulations, mean = 0, sd = 1)
+sigma_samples <- abs(rnorm(num_simulations, mean = 0, sd = 1))
+
+ds$log_gestational_age_c <- scale(log(ds$gest))
+
+# Simulate log birth weights for each set of parameters
+simulated_data <- as_tibble(ds$log_gestational_age_c, .name_repair = "unique")
+for (sim_index in 1:num_simulations) {
+  simulated_mu <- beta0_samples[sim_index] + beta1_samples[sim_index] * ds$log_gestational_age_c
+  column_name <- paste0("simulation_", sim_index)
+  simulated_data[[column_name]] <- simulated_mu + rnorm(n = nrow(ds), mean = 0, sd = sigma_samples[sim_index])
+}
+
+# Plot the distribution of all simulated log birth weights
+simulated_data_long <- pivot_longer(simulated_data, cols = starts_with("simulation"), names_to = "simulation_id", values_to = "simulated_log_birth_weight")
+ggplot(simulated_data_long, aes(x = simulated_log_birth_weight)) + 
+  geom_histogram(aes(y = ..density..), bins = 20, fill = "turquoise", color = "black") +
+  theme_bw(base_size = 16) +
+  geom_vline(xintercept = log(0.3), color = "purple", lwd = 1, lty = 2) +
+  geom_vline(xintercept = log(4), color = "purple", lwd = 1, lty = 2) +
+  labs(x = "Simulated Log Birth Weight", y = "Density", title = "Distribution of Simulated Log Birth Weights")
+
+simulated_data$log_gestational_age_c <- ds$log_gestational_age_c
+
+selected_simulations <- paste0("simulation_", 1:10)
+simulated_data_longer <- pivot_longer(simulated_data, cols = selected_simulations, names_to = "simulation_id", values_to = "simulated_log_birth_weight")
+
+ggplot(simulated_data_longer, aes(x = log_gestational_age_c, y = simulated_log_birth_weight, color = simulation_id)) + 
+  geom_point() +
+  geom_smooth(se = FALSE, method = "lm") +
+  theme_bw() +
+  labs(x = "Standardized Log Gestational Age", y = "Simulated Log Birth Weight", title = "Simulated Log Birth Weights vs. Gestational Age (10 Simulations)")
+```
+
+The distribution plot should show most simulated birth weights within the good range (log(0.3) to log(4) kg), marked by purple lines in the first figure. In the second plot, examining ten simulations against gestational age provides insights into the variability of the model's predictions. Ideally, all simulations should exhibit a positive correlation between gestational age and birth weight, consistent with expected biological relationships, but some simulation shows negative relationship between gestational age and birth body weight, which is contradicting to our EDA.
+
+# Run the model
+
+Now we're going to run Model 1 in Stan. The stan code is in the `code/models` folder. 
+
+First, get our data into right form for input into stan. 
+
+```{r}
+ds$log_weight <- log(ds$birthweight)
+ds$log_gest_c <- (log(ds$gest) - mean(log(ds$gest)))/sd(log(ds$gest))
+
+# put into a list
+stan_data <- list(N = nrow(ds),
+                  log_weight = ds$log_weight,
+                  log_gest = ds$log_gest_c)
+```
+
+Now fit the model
+```{r}
+setwd("/Users/charlie/Desktop/STA2201/Lab 6")
+```
+
+
+```{r}
+mod1 <- stan(data = stan_data, 
+             file = "simple_weight.stan",
+             iter = 500,
+             seed = 243)
+```
+
+```{r}
+summary(mod1)$summary[c("beta[1]", "beta[2]", "sigma"),]
+```
+
+## Question 3
+
+Based on Model 1, give an estimate of the expected birthweight of a baby who was born at a gestational age of 37 weeks. 
+```{r}
+new_age <- (log(37) - mean(log(ds$gest)))/sd(log(ds$gest))
+
+beta0 <- summary(mod1)$summary[c("beta[1]", "beta[2]", "sigma"),][1,1]
+beta1 <- summary(mod1)$summary[c("beta[1]", "beta[2]", "sigma"),][2,1]
+birthweight <- exp(beta0 + beta1 * new_age)
+birthweight
+```
+
+The expected birth weight of a baby who was born at a gestational age of 37 weeks is 2.936397 kg.
+
+## Question 4
+
+Based on Model 1, create a scatter plot showing the underlying data (on the appropriate scale) and 50 posterior draws of the linear predictor. 
+
+```{r}
+pred_matrix <- matrix(ncol = length(ds$log_gest_c), nrow = 50)
+
+for (i in 1:50) {
+  pred_matrix[i,] <- beta0[i] + beta1[i] * ds$log_gest_c
+}
+
+draw_numbers <- rep(1:50, each = length(ds$log_gest_c))
+predictions <- data.frame(
+  draw = draw_numbers,
+  gestation = rep(ds$log_gest_c, times = 50),
+  log_weight_predicted = as.vector(t(pred_matrix))
+)
+
+observations <- data.frame(
+  gestation = ds$log_gest_c, 
+  log_weight_observed = ds$log_weight
+)
+
+ggplot(data = observations, aes(x = gestation, y = log_weight_observed)) +
+  geom_point(color = 'black') +
+  geom_point(data = predictions, aes(x = gestation, y = log_weight_predicted), alpha = 0.3, color = 'blue', size = 1.5) +
+  labs(title = "Scatter plot of observed data and 50 posterior predictions",
+       x = "Standardized Log Gestational Age",
+       y = "Log Birth Weight")
+```
+It shows that the predictive model did a good job in predicting the trend. 
+
+## Question 5
+
+Write a Stan model to run Model 2, and run it. Report a summary of the results, and interpret the coefficient estimate on the interaction term. 
+
+
+```{r}
+ds$preterm_ind <- ifelse(ds$preterm == "Y", 1,0)
+
+stan_model2 <- list(N = nrow(ds),
+                         log_weight = ds$log_weight,
+                         log_gest = ds$log_gest_c,
+                         preterm = ds$preterm_ind,
+                         intercept = ds$preterm_ind * ds$log_gest_c)
+```
+
+```{r}
+mod2 <- stan(data = stan_model2, 
+             file = "simple_weight_2.stan",
+             iter = 500,
+             seed = 243)
+
+save(mod2, file = "mod2_my.Rdata")
+```
+```{r}
+summary(mod2,pars=c("beta","sigma"))
+```
+Now I assumed that there is a typo for the two beta 2 in the model 2, so I used beta 2 and beta 3 for each of them and the interaction term I termed beta 4. Now, from the summary table, the coefficient of the interaction term is 0.196, which means that the impact of gestational age on birth weight is stronger for preterm than for non-preterm by 0.196. This shows that if baby is preterm birth, one unit increase in log of gestational age, on average, will result in 0.196 units expected increase in log of birth weight.
+
+# PPCs
+
+Now we've run two candidate models let's do some posterior predictive checks. The `bayesplot` package has a lot of inbuilt graphing functions to do this. For example, let's plot the distribution of our data (y) against 100 different datasets drawn from the posterior predictive distribution:
+
+```{r}
+set.seed(1856)
+y <- ds$log_weight
+yrep1 <- extract(mod1)[["log_weight_rep"]]
+dim(yrep1)
+samp100 <- sample(nrow(yrep1), 100)
+ppc_dens_overlay(y, yrep1[samp100, ])  + ggtitle("distribution of observed versus predicted birthweights")
+```
+
+## Question 6
+
+Make a similar plot to the one above but for Model 2, and **not** using the bayes plot in built function (i.e. do it yourself just with `geom_density`)
+
+```{r}
+fit2 <- extract(mod2)
+yrep2 <- fit2$log_weight_rep
+weight_post <- yrep2[samp100,]
+
+df_plot <- data.frame(
+  value = c(as.vector(weight_post), y),
+  type = rep(c(rep("Posterior Predicted", nrow(weight_post)), "Observed"), each = length(y)),
+  draws = rep(0:nrow(weight_post), each = length(y))
+)
+
+ggplot(df_plot, aes(x = value, color = type, group = interaction(type, draws))) +
+  geom_density() +
+  scale_color_manual(values = c("black", "lightblue")) +
+  ggtitle("distribution of Observed versus Predicted Birth Weights")
+```
+As it shows that model 2 has a much better posterior estmation than model 1, with the additional predictors. 
+
+## Test statistics
+
+We can also look at some summary statistics in the PPD versus the data, again either using `bayesplot` -- the function of interest is `ppc_stat` or `ppc_stat_grouped` -- or just doing it ourselves using ggplot. 
+
+E.g. medians by prematurity for Model 1
+
+```{r}
+ppc_stat_grouped(ds$log_weight, yrep1, group = ds$preterm, stat = 'median')
+```
+
+## Question 7
+
+Use a test statistic of the proportion of births under 2.5kg. Calculate the test statistic for the data, and the posterior predictive samples for both models, and plot the comparison (one plot per model). 
+
+```{r}
+# Test statistic for the original data
+original_log_weight <- ds$log_weight
+proportion_under_2_5kg_original <- mean(original_log_weight <= log(2.5))
+proportion_under_2_5kg_original
+
+# Test statistics for simulations from Model 1
+proportion_under_2_5kg_model1 <- sapply(1:nrow(yrep1), function(i) mean(yrep1[i,] <= log(2.5)))
+
+# Test statistics for simulations from Model 2
+proportion_under_2_5kg_model2 <- sapply(1:nrow(yrep2), function(i) mean(yrep2[i,] <= log(2.5)))
+
+# Histogram for simulated data from Model 1 with observed test statistic line
+ggplot(as_tibble(proportion_under_2_5kg_model1), aes(x = value)) + 
+  geom_histogram(aes(fill = "Simulated"), bins = 30, boundary = 0) + 
+  geom_vline(xintercept = proportion_under_2_5kg_original, color = "darkblue", lwd = 1.5) + 
+  ggtitle("Model 1: Proportion of Births < 2.5kg") + 
+  theme_bw(base_size = 10) + 
+  scale_fill_manual(name = "", values = c("Simulated" = "lightblue"))
+
+# Histogram for simulated data from Model 2 with observed test statistic line
+ggplot(as_tibble(proportion_under_2_5kg_model2), aes(x = value)) + 
+  geom_histogram(aes(fill = "Simulated"), bins = 30, boundary = 0) + 
+  geom_vline(xintercept = proportion_under_2_5kg_original, color = "darkblue", lwd = 1.5) + 
+  ggtitle("Model 2: Proportion of Births < 2.5kg") + 
+  theme_bw(base_size = 10) + 
+  scale_fill_manual(name = "", values = c("Simulated" = "lightblue"))
+```
+
+
+Observation:
+
+The calculated test statistic for the original data indicates that approximately 8.2% of newborns weigh less than 2.5kg. The comparative histograms for both models show the distribution of this statistic across simulations. From these visualizations, it is apparent that the observed proportion aligns more closely with the predictions from Model 2. The histogram for Model 1 suggests a higher predicted proportion of newborns under the 2.5kg threshold, deviates from the observed data.
+
+
+# LOO
+
+Finally let's calculate the LOO elpd for each model and compare. The first step of this is to get the point-wise log likelihood estimates from each model:
+
+```{r}
+loglik1 <- extract(mod1)[["log_lik"]]
+```
+
+
+And then we can use these in the `loo` function to get estimates for the elpd. Note the `save_psis = TRUE` argument saves the calculation for each simulated draw, which is needed for the LOO-PIT calculation below. 
+
+```{r}
+loo1 <- loo(loglik1, save_psis = TRUE)
+```
+
+Look at the output:
+
+
+```{r}
+loo1
+```
+
+## Question 8
+Get the LOO estimate of elpd for Model 2 and compare the two models with the `loo_compare` function. Interpret the results. 
+
+```{r}
+loglik2 <- fit2$log_lik
+loo2 <- loo(loglik2, save_psis = TRUE)
+loo2
+
+loo_comparison <- loo_compare(loo1, loo2)
+loo_comparison
+```
+The above suggests that model 1 might be a better fit than model 2. However, it is worth noting that some pareto k values are too high and thus the result might not be accurate for model 2.
+
+We can also compare the LOO-PIT of each of the models to standard uniforms. For example for Model 1:
+
+```{r}
+ppc_loo_pit_overlay(yrep = yrep1, y = y, lw = weights(loo1$psis_object))
+```
+
+## Bonus question (not required)
+
+Create your own PIT histogram "from scratch" for Model 2. 
+
+```{r}
+# Prepare the simulated data from Model 2 for analysis
+set.seed(3729)
+simulated_log_weights <- extract(mod2)[["log_weight_rep"]]
+selected_samples <- sample(nrow(simulated_log_weights), 100)
+
+# Convert the simulated weights to a tibble and add observed weights
+simulated_data <- as_tibble(t(simulated_log_weights)) %>%
+  bind_cols(observation_index = 1:nrow(ds), observed_log_weight = log(ds$birthweight))
+
+# Reshape the data into a long format suitable for ggplot
+long_simulated_data <- simulated_data %>% 
+  pivot_longer(cols = -c(observation_index, observed_log_weight), names_to = "simulation", values_to = "simulated_log_weight")
+
+# Add a column to indicate if the observed weight is less than or equal to the simulated weight
+long_simulated_data <- long_simulated_data %>%
+  mutate(under_threshold = as.numeric(observed_log_weight <= simulated_log_weight))
+
+# Group by observation index and calculate the proportion for the Probability Integral Transform (PIT)
+pit_summary <- long_simulated_data %>%
+  group_by(observation_index) %>%
+  summarize(proportion_under_threshold = mean(under_threshold))
+
+# Generate a histogram with a density plot for the PIT
+pit_summary %>%
+  ggplot(aes(x = proportion_under_threshold)) +
+  geom_histogram(aes(y = ..density..), bins = 20, fill = "lightblue", color = "grey") +
+  geom_density(color = "darkblue", lwd = 1.5) +
+  labs(x = "Proportion Under Threshold", y = "Density", 
+       title = "Probability Integral Transform (PIT) for Model 2") +
+  theme_bw()
+```
+
+## Question 9
+
+Based on the original dataset, choose one (or more) additional covariates to add to the linear regression model. Run the model in Stan, and compare with Model 2 above on at least 2 posterior predictive checks.
+
+I brought the variable "sex" into the model as an extra feature.  
+$$
+\log(y_i) \sim N(\beta_1 + \beta_2\log(x_i) + \beta_3 z_i + \beta_4\log(x_i) z_i + \beta_5s_i, \sigma^2)
+$$
+where 
+
+- $y_i$ is weight in kg
+- $x_i$ is gestational age in weeks
+- $z_i$ is preterm (0 or 1, if gestational age is less than 32 weeks)
+- $s_i$ is sex (0 or 1, for female or male)
+
+```{r}
+# indicator for sex
+ds$sex_ind <- ifelse(ds$preterm == "M", 1,0)
+
+# prepare data
+stan_data_model3 <- list(N = nrow(ds),
+                         log_weight = ds$log_weight,
+                         log_gest = ds$log_gest_c,
+                         preterm = ds$preterm_ind,
+                         intercept = ds$preterm_ind * ds$log_gest_c,
+                         sex = ds$sex_ind)
+```
+
+```{r}
+mod3 <- stan(data = stan_data_model3, 
+             file = "simple_weight_3.stan",
+             iter = 500,
+             seed = 243)
+```
+
+1. To assess model performance, we look at the posterior predictive distributions for model 2 and 3:
+
+
+
+```{r}
+set.seed(2201)
+
+# Extract posterior predictive data
+yrep_mod2 <- extract(mod2)[["log_weight_rep"]] 
+yrep_mod3 <- extract(mod3)[["log_weight_rep"]]
+
+# Sample 100 simulated datasets for comparison
+sample_indices <- sample(nrow(yrep_mod2), 100)
+
+# Compare observed data to simulations for Model 2 and Model 3
+ppc_dens_overlay(y, yrep_mod2[sample_indices, ]) + 
+  ggtitle("Observed vs. Predicted Birthweights from Model 2")
+
+ppc_dens_overlay(y, yrep_mod3[sample_indices, ]) + 
+  ggtitle("Observed vs. Predicted Birthweights from Model 3")
+```
+
+We see that both model looks similar and do not deviate much from the observed data.
+
+
+2. Test Statistics: median of different education between the two model
+
+We further examine the median birthweight for different education levels by constructing a binary indicator for higher education based on the "meduc" variable:
+
+```{r}
+# Binary indicator for higher education level
+ds$higher_edu <- ifelse(ds$meduc > 4, 1, 0)
+
+# Posterior predictive checks by education level
+ppc_stat_grouped(ds$log_weight, yrep_mod2, group = ds$higher_edu, stat = 'median')
+ppc_stat_grouped(ds$log_weight, yrep_mod3, group = ds$higher_edu, stat = 'median')
+```
+
+The results indicate that both models perform comparably across education levels, although they seem less accurate for individuals with higher education.
+
+
+Lastly, we revisit the test statistic of the proportion of births under 2.5kg to compare Model 2 and Model 3:
+
+
+```{r}
+# Test statistics for the original data
+obs_proportion_under_2_5kg <- mean(ds$log_weight <= log(2.5))
+
+# Test statistics for posterior predictive simulations
+sim_proportion_under_2_5kg_mod2 <- sapply(1:nrow(yrep_mod2), function(i) mean(yrep_mod2[i, ] <= log(2.5)))
+sim_proportion_under_2_5kg_mod3 <- sapply(1:nrow(yrep_mod3), function(i) mean(yrep_mod3[i, ] <= log(2.5)))
+
+# Histogram plots for the test statistics of both models
+ggplot(as_tibble(sim_proportion_under_2_5kg_mod2), aes(x = value)) + 
+  geom_histogram(aes(fill = "Model 2 Predictions"), bins = 20, color = "grey") +
+  geom_vline(xintercept = obs_proportion_under_2_5kg, color = "darkblue", lwd = 1.5) +
+  ggtitle("Model 2: Proportion of Births < 2.5kg") +
+  theme_bw() +
+  scale_fill_manual(name = "", values = c("Model 2 Predictions" = "lightblue"))
+
+ggplot(as_tibble(sim_proportion_under_2_5kg_mod3), aes(x = value)) + 
+  geom_histogram(aes(fill = "Model 3 Predictions"), bins = 20, color = "grey") +
+  geom_vline(xintercept = obs_proportion_under_2_5kg, color = "darkblue", lwd = 1.5) +
+  ggtitle("Model 3: Proportion of Births < 2.5kg") +
+  theme_bw() +
+  scale_fill_manual(name = "", values = c("Model 3 Predictions" = "lightblue"))
+```
+
+Model 3 shows a slightly more concentrated distribution around the observed test statistic, which may suggest a slight improvement over Model 2.
+
+Upon completion of all checks, it appears that the addition of the "sex" variable to Model 2 has offered a very limited imporvement. 
+
+```{r}
+fit3 <- extract(mod3)
+loglik3 <- fit3$log_lik
+loo3 <- loo(loglik3, save_psis = TRUE)
+loo_comparison <- loo_compare(loo2, loo3)
+loo_comparison
+```
+
+
+As expected, model 3 is a bit better than model 2 by imporve elpd_diff by 0.5. 
